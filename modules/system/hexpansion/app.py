@@ -5,14 +5,20 @@ from system.hexpansion.config import HexpansionConfig
 from system.hexpansion.events import (
     HexpansionRemovalEvent,
     HexpansionInsertionEvent,
+    HexpansionAppRequestStartEvent,
+    HexpansionAppRequestStopEvent,
     HexpansionMountedEvent,
     HexpansionUnmountedEvent,
+    HexpansionAppLauncherRemoveEvent,
 )
+
 from system.hexpansion.util import (
     read_hexpansion_header,
     get_hexpansion_block_devices,
     detect_eeprom_addr,
+    handle_insertion_lock,
 )
+from system.launcher.utils import load_manifest
 
 from app_components.dialog import YesNoDialog
 from system.notification.events import ShowNotificationEvent
@@ -22,6 +28,7 @@ from system.scheduler.events import (
     RequestStartAppEvent,
     RequestStopAppEvent,
 )
+from system.capabilities.utils import get_manifest_from_compact_app_format
 from tildagonos import EPIN_ND_A, EPIN_ND_B, EPIN_ND_C, EPIN_ND_D, EPIN_ND_E, EPIN_ND_F
 from egpio import ePin
 from system.eventbus import eventbus
@@ -32,13 +39,13 @@ import vfs
 import sys
 
 
-def Hexspansion_inserted(epin):
+def Hexpansion_inserted(epin):
     for i, nPin in enumerate(HexpansionManagerApp.hexpansion_pins):
         if nPin is epin:
             eventbus.emit(HexpansionInsertionEvent(port=i + 1))
 
 
-def Hexspansion_removed(epin):
+def Hexpansion_removed(epin):
     for i, nPin in enumerate(HexpansionManagerApp.hexpansion_pins):
         if nPin is epin:
             eventbus.emit(HexpansionRemovalEvent(port=i + 1))
@@ -62,6 +69,13 @@ class HexpansionManagerApp(app.App):
             HexpansionInsertionEvent, self.handle_hexpansion_insertion, self
         )
         eventbus.on_async(HexpansionRemovalEvent, self.handle_hexpansion_removal, self)
+        eventbus.on(
+            HexpansionAppRequestStartEvent, self.handle_hexpansion_app_start, self
+        )
+        eventbus.on(
+            HexpansionAppRequestStopEvent, self.handle_hexpansion_app_stop, self
+        )
+
         self.mountpoints = {}
         self.format_requests = []
         self.format_dialog = None
@@ -69,11 +83,13 @@ class HexpansionManagerApp(app.App):
         self.buttons = Buttons(self)
         self.hexpansion_apps = {}
         self.hexpansion_headers = {}
+        self.hexpansion_manifests = {}
         self.autolaunch = autolaunch
+        self.inserted_hexpansions = {}
 
         for i, pin in enumerate(HexpansionManagerApp.hexpansion_pins):
-            pin.irq(handler=Hexspansion_inserted, trigger=pin.IRQ_FALLING)
-            pin.irq(handler=Hexspansion_removed, trigger=pin.IRQ_RISING)
+            pin.irq(handler=Hexpansion_inserted, trigger=pin.IRQ_FALLING)
+            pin.irq(handler=Hexpansion_removed, trigger=pin.IRQ_RISING)
             if not pin.value():
                 eventbus.emit(HexpansionInsertionEvent(port=i + 1))
 
@@ -114,8 +130,23 @@ class HexpansionManagerApp(app.App):
             sys.path.append(p)
         os.chdir(old_cwd)
 
+    def _try_filesystem_driver(self, port):
+        header = self.hexpansion_headers[port]
+        path = f"/drivers/hex_{header.vid:04x}_{header.pid:04x}"
+        print(f"Trying FS driver at {path}")
+        _package = __import__(f"{path}.app")
+        package = _package.app
+        return package
+
     def _launch_hexpansion_app(self, port):
         if port not in self.mountpoints:
+            return
+
+        if port in self.hexpansion_apps:
+            # The hexpansion app is already running, foreground it. Avoids launching duplicate apps, but allows
+            # launching duplicate apps when several of the same hexpansion are plugged in, each addressing a different port
+            print(f"App is already running, requesting foreground push for port {port}")
+            eventbus.emit(RequestForegroundPushEvent(self.hexpansion_apps[port]))
             return
 
         mount = self.mountpoints[port].lstrip("/")
@@ -128,14 +159,24 @@ class HexpansionManagerApp(app.App):
         if "remote" in os.listdir():
             sys.path.append("/remote")
 
+        package = None
         try:
             _package = __import__(f"{mount}.app")
             package = _package.app
             print(f"Found app package: {package}")
-        except (ImportError, SyntaxError) as e:
+        except (ImportError, SyntaxError, ValueError) as e:
             print(e)
             print("App module not found")
             self._cleanup_import_path(old_cwd, old_sys_path)
+
+        if package is None:
+            try:
+                package = self._try_filesystem_driver(port)
+            except Exception as e:
+                print(e)
+                print("Failed to load fs driver")
+
+        if package is None:
             return
 
         try:
@@ -161,6 +202,15 @@ class HexpansionManagerApp(app.App):
 
         eventbus.emit(RequestStartAppEvent(app))
         self.hexpansion_apps[port] = app
+
+        if not self.hexpansion_manifests.get(port, {}):
+            try:
+                self.hexpansion_manifests[port] = get_manifest_from_compact_app_format(
+                    app
+                )
+            except Exception as e:
+                sys.print_exception(e)
+                pass
 
         self._cleanup_import_path(old_cwd, old_sys_path)
 
@@ -207,6 +257,14 @@ class HexpansionManagerApp(app.App):
         if self.autolaunch:
             self._launch_hexpansion_app(port)
 
+    def handle_hexpansion_app_start(self, event):
+        if event.port in self.hexpansion_apps:
+            self._launch_hexpansion_app(event.port)
+
+    def handle_hexpansion_app_stop(self, event):
+        if event.port in self.hexpansion_apps:
+            self._stop_hexpansion_app(event.port)
+
     async def handle_hexpansion_insertion(self, event):
         print(event)
         i2c = I2C(event.port)
@@ -219,6 +277,12 @@ class HexpansionManagerApp(app.App):
         if addr is None:
             print("Scan found no eeproms")
             return
+
+        # acquire and release the insertion lock - we don't care about
+        # keeping locked, but someone (provisioning) may want us to wait
+        # at this step
+        await handle_insertion_lock.acquire()
+        handle_insertion_lock.release()
 
         # Do we have a header?
         try:
@@ -262,6 +326,14 @@ class HexpansionManagerApp(app.App):
         if eep is not None and partition is not None:
             self._mount_eeprom(partition, event.port)
 
+        if not self.hexpansion_manifests.get(event.port):
+            try:
+                self.hexpansion_manifests[event.port] = load_manifest(
+                    "", self.mountpoints[event.port].strip("/")
+                )
+            except Exception:
+                self.hexpansion_manifests[event.port] = {}
+
         eventbus.emit(HexpansionMountedEvent(port=event.port, header=header))
 
     async def handle_hexpansion_removal(self, event):
@@ -270,10 +342,14 @@ class HexpansionManagerApp(app.App):
 
         if event.port in self.hexpansion_apps:
             self._stop_hexpansion_app(event.port)
+            eventbus.emit(HexpansionAppLauncherRemoveEvent(port=event.port))
 
         if event.port in self.hexpansion_headers:
             header = self.hexpansion_headers[event.port]
             self.hexpansion_headers[event.port] = None
+
+        if event.port in self.hexpansion_manifests:
+            self.hexpansion_manifests[event.port] = None
 
         if event.port in self.mountpoints:
             print(f"Unmounting {self.mountpoints[event.port]}")
